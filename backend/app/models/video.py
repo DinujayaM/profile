@@ -59,6 +59,8 @@ class Video(Base, TimestampMixin):
     rejection_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     approved_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
     youtube_video_id: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    file_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)         # local rendered file
+    thumbnail_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)    # local thumbnail file
     subtitle_file_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     production_metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
@@ -79,7 +81,11 @@ class VideoScene(Base, TimestampMixin):
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     image_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     video_clip_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    video_clip_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)  # local FS path
     video_clip_key: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    audio_path: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)       # local FS path
+    dialogue: Mapped[Optional[str]] = mapped_column(Text, nullable=True)                # subtitle text
+    scene_number: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     duration_seconds: Mapped[float] = mapped_column(Float, default=5.0, nullable=False)
     image_provider: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     video_provider: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
