@@ -11,7 +11,7 @@ permissions:
   id-token: write
 
 jobs:
-  # ── Frontend → GitHub Pages ──────────────────────────────────────────────
+  # ── Frontend → GitHub Pages ────────────────────────────────────────────────────────────────────
   deploy-frontend:
     runs-on: ubuntu-latest
     environment:
@@ -23,12 +23,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
         working-directory: frontend
-        run: npm ci
+        run: npm install
 
       - name: Build
         working-directory: frontend
@@ -46,7 +44,7 @@ jobs:
         id: deploy
         uses: actions/deploy-pages@v4
 
-  # ── Backend tests ────────────────────────────────────────────────────────
+  # ── Backend tests ────────────────────────────────────────────────────────────────────────
   test-backend:
     runs-on: ubuntu-latest
     services:
