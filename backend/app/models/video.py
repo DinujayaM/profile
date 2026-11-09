@@ -113,6 +113,6 @@ class VideoJob(Base, TimestampMixin):
     started_at: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     completed_at: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     cost_usd: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
-    metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    job_metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     video: Mapped[Optional["Video"]] = relationship("Video", back_populates="jobs")

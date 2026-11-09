@@ -32,7 +32,7 @@ class CostRecord(Base, TimestampMixin):
     unit_type: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)   # tokens, images, seconds, chars
     description: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
     record_date: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)  # YYYY-MM-DD
-    metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    extra_metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
 
 class CostLimit(Base, TimestampMixin):
