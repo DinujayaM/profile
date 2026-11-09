@@ -1,165 +1,229 @@
-"""YouTube OAuth and upload endpoints."""
+"""YouTube API endpoints.
+
+OAuth2 flow, channel management, upload scheduling, and admin approval.
+Uploads always start as private; public scheduling requires admin approval.
+"""
+import secrets
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
+
 from app.core.database import get_db
 from app.core.security import get_current_user, require_admin
-from app.models.youtube import YouTubeChannel, YouTubeUpload, UploadStatus, PrivacyStatus
-from app.models.video import Video, VideoStatus
 from app.models.user import User
-from app.core.config import settings
+from app.models.youtube import YouTubeChannel, YouTubeUpload, UploadStatus, PrivacyStatus
+from app.services.youtube_service import YouTubeService
+from app.workers.tasks.video_tasks import upload_to_youtube
 
 router = APIRouter(prefix="/youtube", tags=["youtube"])
+
+# In-memory CSRF state store (use Redis in production)
+_oauth_states: dict[str, int] = {}
 
 
 class UploadRequest(BaseModel):
     video_id: int
+    channel_id: int
     title: str
-    description: str
-    tags: Optional[list[str]] = None
-    privacy_status: PrivacyStatus = PrivacyStatus.private
+    description: str = ""
+    tags: list[str] = []
+    category_id: str = "27"
     made_for_kids: bool = True
-    scheduled_publish_at: Optional[str] = None
 
 
-class UploadResponse(BaseModel):
-    id: int
-    video_id: int
-    youtube_video_id: Optional[str]
-    upload_status: UploadStatus
-    upload_progress_pct: int
-    error_message: Optional[str]
-    model_config = {"from_attributes": True}
+class ScheduleRequest(BaseModel):
+    upload_id: int
+    publish_at: str  # ISO8601 e.g. "2025-01-15T18:00:00Z"
 
 
-class ChannelResponse(BaseModel):
-    id: int
-    channel_id: str
-    channel_name: Optional[str]
-    channel_url: Optional[str]
-    subscriber_count: Optional[int]
-    total_views: Optional[int]
-    video_count: Optional[int]
-    quota_used_today: int
-    daily_quota_limit: int
-    is_active: bool
-    model_config = {"from_attributes": True}
+class ApproveUploadRequest(BaseModel):
+    upload_id: int
 
 
 @router.get("/auth-url")
-async def get_auth_url(_: User = Depends(require_admin)):
-    """Return the OAuth2 URL to connect a YouTube channel."""
-    if not settings.YOUTUBE_CLIENT_ID:
-        raise HTTPException(503, "YouTube OAuth not configured. Set YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET.")
-    scope = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
-    url = (
-        "https://accounts.google.com/o/oauth2/auth"
-        f"?client_id={settings.YOUTUBE_CLIENT_ID}"
-        f"&redirect_uri={settings.YOUTUBE_REDIRECT_URI}"
-        "&response_type=code"
-        f"&scope={scope}"
-        "&access_type=offline"
-        "&prompt=consent"
-    )
-    return {"auth_url": url}
+async def get_auth_url(
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Generate the YouTube OAuth2 authorization URL."""
+    state = secrets.token_urlsafe(32)
+    _oauth_states[state] = current_user.id
+    svc = YouTubeService(db)
+    url, _ = svc.build_auth_url(state=state)
+    return {"auth_url": url, "state": state}
 
 
 @router.get("/callback")
-async def oauth_callback(code: str, db: AsyncSession = Depends(get_db)):
-    """Handle OAuth2 callback from Google."""
-    import httpx
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "https://oauth2.googleapis.com/token",
-            data={
-                "code": code,
-                "client_id": settings.YOUTUBE_CLIENT_ID,
-                "client_secret": settings.YOUTUBE_CLIENT_SECRET,
-                "redirect_uri": settings.YOUTUBE_REDIRECT_URI,
-                "grant_type": "authorization_code",
-            },
-        )
-        resp.raise_for_status()
-        tokens = resp.json()
-
-    # Get channel info
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(
-            "https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&mine=true",
-            headers={"Authorization": f"Bearer {tokens['access_token']}"},
-        )
-        channel_data = resp.json()
-
-    channel_info = channel_data["items"][0] if channel_data.get("items") else {}
-    channel_id = channel_info.get("id", "unknown")
-
-    result = await db.execute(select(YouTubeChannel).where(YouTubeChannel.channel_id == channel_id))
-    channel = result.scalar_one_or_none()
-    if not channel:
-        channel = YouTubeChannel(channel_id=channel_id)
-        db.add(channel)
-
-    # Store tokens encrypted (simplified – use proper encryption in production)
-    channel.access_token_encrypted = tokens.get("access_token", "")
-    channel.refresh_token_encrypted = tokens.get("refresh_token", "")
-    channel.channel_name = channel_info.get("snippet", {}).get("title")
-    channel.channel_url = f"https://youtube.com/channel/{channel_id}"
-    stats = channel_info.get("statistics", {})
-    channel.subscriber_count = int(stats.get("subscriberCount", 0))
-    channel.total_views = int(stats.get("viewCount", 0))
-    channel.video_count = int(stats.get("videoCount", 0))
-
-    await db.flush()
-    return {"message": "YouTube channel connected", "channel_name": channel.channel_name}
-
-
-@router.get("/channels", response_model=list[ChannelResponse])
-async def list_channels(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
-    result = await db.execute(select(YouTubeChannel).where(YouTubeChannel.is_active == True))
-    return result.scalars().all()
-
-
-@router.post("/uploads", response_model=UploadResponse, status_code=202)
-async def schedule_upload(
-    payload: UploadRequest,
+async def oauth_callback(
+    code: str,
+    state: str,
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(require_admin),
 ):
-    video = await db.get(Video, payload.video_id)
-    if not video:
-        raise HTTPException(404, "Video not found")
-    if video.status != VideoStatus.approved:
-        raise HTTPException(400, "Video must be approved before uploading")
+    """Exchange OAuth code for tokens and persist channel."""
+    user_id = _oauth_states.pop(state, None)
+    if not user_id:
+        raise HTTPException(status_code=400, detail="Invalid or expired OAuth state")
 
-    result = await db.execute(select(YouTubeChannel).where(YouTubeChannel.is_active == True))
-    channel = result.scalar_one_or_none()
-    if not channel:
-        raise HTTPException(503, "No YouTube channel connected")
+    svc = YouTubeService(db)
+    token_data = await svc.exchange_code(code)
+    channel = await svc.save_channel(token_data, user_id)
+    return {
+        "channel_id": channel.channel_id,
+        "channel_name": channel.channel_name,
+        "message": "Channel connected successfully",
+    }
 
+
+@router.get("/channels")
+async def list_channels(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(YouTubeChannel).where(YouTubeChannel.is_active == True)
+    )
+    channels = result.scalars().all()
+    return [
+        {
+            "id": c.id,
+            "channel_id": c.channel_id,
+            "channel_name": c.channel_name,
+            "channel_url": c.channel_url,
+            "thumbnail_url": c.thumbnail_url,
+            "subscriber_count": c.subscriber_count,
+            "video_count": c.video_count,
+            "quota_used_today": c.quota_used_today,
+            "daily_quota_limit": c.daily_quota_limit,
+        }
+        for c in channels
+    ]
+
+
+@router.post("/uploads")
+async def create_upload(
+    req: UploadRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Queue a video for YouTube upload. Upload is always private initially."""
     upload = YouTubeUpload(
-        video_id=payload.video_id,
-        channel_id=channel.id,
-        title=payload.title,
-        description=payload.description,
-        tags=payload.tags,
-        privacy_status=payload.privacy_status,
-        made_for_kids=payload.made_for_kids,
-        scheduled_publish_at=payload.scheduled_publish_at,
+        video_id=req.video_id,
+        channel_id=req.channel_id,
+        title=req.title,
+        description=req.description,
+        tags=req.tags,
+        category_id=req.category_id,
+        made_for_kids=req.made_for_kids,
+        privacy_status=PrivacyStatus.private,
         upload_status=UploadStatus.pending,
         uploaded_by_id=current_user.id,
     )
     db.add(upload)
     await db.flush()
-    # In production: dispatch Celery task
-    # from app.workers.tasks.video_tasks import upload_to_youtube
-    # upload_to_youtube.delay(upload.id)
-    video.status = VideoStatus.uploading
-    return upload
+    upload_id = upload.id
+
+    # Kick off upload in background worker
+    background_tasks.add_task(upload_to_youtube.delay, upload_id)
+
+    return {"upload_id": upload_id, "status": "queued", "privacy": "private"}
 
 
-@router.get("/uploads", response_model=list[UploadResponse])
-async def list_uploads(db: AsyncSession = Depends(get_db), _: User = Depends(get_current_user)):
-    result = await db.execute(select(YouTubeUpload).order_by(YouTubeUpload.created_at.desc()).limit(50))
-    return result.scalars().all()
+@router.get("/uploads")
+async def list_uploads(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    offset = (page - 1) * page_size
+    result = await db.execute(
+        select(YouTubeUpload).order_by(YouTubeUpload.created_at.desc())
+        .offset(offset).limit(page_size)
+    )
+    uploads = result.scalars().all()
+    return [
+        {
+            "id": u.id,
+            "video_id": u.video_id,
+            "title": u.title,
+            "youtube_video_id": u.youtube_video_id,
+            "upload_status": u.upload_status,
+            "privacy_status": u.privacy_status,
+            "upload_progress_pct": u.upload_progress_pct,
+            "admin_approved": u.admin_approved,
+            "scheduled_publish_at": u.scheduled_publish_at,
+            "created_at": u.created_at.isoformat(),
+        }
+        for u in uploads
+    ]
+
+
+@router.post("/uploads/{upload_id}/approve")
+async def approve_upload(
+    upload_id: int,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin approval required before a video can be scheduled for public publish."""
+    upload = await db.get(YouTubeUpload, upload_id)
+    if not upload:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    upload.admin_approved = True
+    return {"upload_id": upload_id, "admin_approved": True}
+
+
+@router.post("/uploads/schedule-public")
+async def schedule_public(
+    req: ScheduleRequest,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Schedule a private (and admin-approved) video to go public at a future time."""
+    upload = await db.get(YouTubeUpload, req.upload_id)
+    if not upload:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    if not upload.admin_approved:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin approval required before scheduling public publish",
+        )
+    if upload.upload_status != UploadStatus.published:
+        raise HTTPException(status_code=400, detail="Video is not yet uploaded to YouTube")
+
+    svc = YouTubeService(db)
+    await svc.schedule_public_publish(req.upload_id, req.publish_at)
+    return {
+        "upload_id": req.upload_id,
+        "scheduled_publish_at": req.publish_at,
+        "privacy_status": "scheduled",
+    }
+
+
+@router.delete("/channels/{channel_id}/revoke")
+async def revoke_channel(
+    channel_id: int,
+    current_user: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Revoke OAuth tokens and disconnect a channel."""
+    from app.services.youtube_service import decrypt_token
+
+    channel = await db.get(YouTubeChannel, channel_id)
+    if not channel:
+        raise HTTPException(status_code=404, detail="Channel not found")
+
+    svc = YouTubeService(db)
+    if channel.access_token_encrypted:
+        try:
+            token = decrypt_token(channel.access_token_encrypted)
+            await svc.revoke_token(token)
+        except Exception:
+            pass  # Revocation best-effort
+
+    channel.is_active = False
+    channel.access_token_encrypted = None
+    channel.refresh_token_encrypted = None
+    return {"message": "Channel disconnected and tokens revoked"}

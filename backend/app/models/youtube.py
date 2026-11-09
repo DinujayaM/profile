@@ -39,7 +39,14 @@ class YouTubeChannel(Base, TimestampMixin):
     quota_used_today: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     daily_quota_limit: Mapped[int] = mapped_column(Integer, default=10000, nullable=False)
 
+    owner_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    thumbnail_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+
     uploads: Mapped[list["YouTubeUpload"]] = relationship("YouTubeUpload", back_populates="channel", lazy="select")
+
+
+class ScheduledStatus(str, enum.Enum):
+    scheduled = "scheduled"
 
 
 class YouTubeUpload(Base, TimestampMixin):
@@ -63,5 +70,6 @@ class YouTubeUpload(Base, TimestampMixin):
     thumbnail_uploaded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     quota_cost: Mapped[int] = mapped_column(Integer, default=1600, nullable=False)
     uploaded_by_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"), nullable=True)
+    admin_approved: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     channel: Mapped["YouTubeChannel"] = relationship("YouTubeChannel", back_populates="uploads")
