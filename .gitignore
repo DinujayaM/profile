@@ -28,6 +28,9 @@ frontend/package-lock.json
 # Storage
 storage/
 
+# Generated video assets
+kids_videos/
+
 # Logs
 *.log
 logs/
